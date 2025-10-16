@@ -53,6 +53,7 @@ class CreditScoreClassifier:
     @bentoml.on_startup
     def initialize(self):
         self.session_maker = SessionLocal
+    # 세션메이커 init
 
     @bentoml.api
     def predict(self, data: Features) -> Response:
@@ -71,19 +72,28 @@ class CreditScoreClassifier:
         customer_id = df.pop("customer_id").item()
 
         # TODO: RobustScaler 적용
-
+        for col, scaler in self.robust_scalers.items():
+            df[col] = scaler.transform(df[[col]])
         # TODO: 모델 추론 결과로 확률값과 예측 레이블을 저장
-        prob = None
-        label = None
-
+        prob = np.max(self.model.predict(df, prediction_type="Probability"))
+        label = self.model.predict(df, prediction_type="Class").item()
+        
         elapsed_ms = (time.time() - start_time) * 1000
 
         record = CreditPredictionApiLog(
             # TODO: 기본값이 존재하지 않는 컬럼에 적절한 값 매핑
+            customer_id=customer_id,
+            features=data.model_dump(),
+            prediction=label,
+            confidence=prob,
+            elapsed_ms=elapsed_ms,
         )
 
         # TODO: 로깅할 값을 테이블에 적재 후 커밋
-
+        # 실제 서비스에서 이부분은 백그라운드 task로 fastapi에서 제공하는기능으로 구현하여 서비스 제공/ 해당 부분은 디비에 로그를 적재하는거라 사용자에게 하는 세션에서 궅이 포함 x
+        with self.session_maker() as db:
+            with db.begin():
+                db.add(record)
         return Response(customer_id=customer_id, predict=label, confidence=prob)
 
     @bentoml.api(route="/metadata", output_spec=MetadataResponse)
