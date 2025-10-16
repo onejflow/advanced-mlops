@@ -12,6 +12,8 @@ from airflow.providers.standard.operators.python import (
 from airflow.sdk import DAG, Variable, get_current_context
 
 from utils.callbacks import failure_callback, success_callback
+from fastapi import status
+
 
 local_timezone = pendulum.timezone("Asia/Seoul")
 airflow_dags_path = Variable.get("AIRFLOW_DAGS_PATH")
@@ -24,10 +26,15 @@ def get_branch_by_api_status() -> list[str] | str:
     """
     try:
         response = requests.get("http://localhost:3000/healthz")
-        if response.status_code == 200:
+        #if response.status_code == 200: --> from fastapi import status -> http 코드를 다 상수로 둠 그래서 status.HTTP_200_OK 권장
+        if response.status_code == status.HTTP_200_OK:
+            
             # TODO: 헬스체크의 응답이 올바르게 왔다면 다음 Task를 실행해야 함
             # "get_deployed_model_creation_time", "get_latest_trained_model_creation_time" 를 실행해야 함
-            return
+            return [
+                "get_deployed_model_creation_time",
+                "get_latest_trained_model_creation_time",
+            ]
         else:
             return "deploy_new_model"
     except Exception as e:
@@ -38,10 +45,12 @@ def get_branch_by_api_status() -> list[str] | str:
 def get_deployed_model_creation_time() -> datetime | None:
     """이미 배포된 모델의 `creation_time`을 조회합니다."""
     try:
-        response = requests.post("http://localhost:3000/metadata")
-        if response.status_code == 200:
-            # TODO: 메타데이터 조회 응답이 올바르게 왔다면 메타데이터 내 모델의 생성 시간(creation_time)을 datetime 객체로 반환해야 함
-            return
+        response = requests.post("http://localhost:3000/metadata") # bentoml 
+        # TODO: 메타데이터 조회 응답이 올바르게 왔다면 메타데이터 내 모델의 생성 시간(creation_time)을 datetime 객체로 반환해야 함
+        if response.status_code == status.HTTP_200_OK:
+            return datetime.strptime(
+                response.json().get("creation_time"), "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
         else:
             print(
                 f"`creation_time`을 불러올 수 없습니다.: {response.status_code}"
@@ -57,7 +66,7 @@ def get_latest_trained_model_creation_time() -> datetime | None:
     try:
         bento_model = bentoml.models.get("credit_score_classification:latest")
         # TODO: bento_model의 creation_time의 timezone 정보를 제거하고 반환
-        return
+        return bento_model.info.creation_time.replace(tzinfo=None)
     except Exception as e:
         print(f"Error getting latest trained model creation time: {e}")
         return None
@@ -119,26 +128,34 @@ with DAG(
     tags=set(["lgcns", "mlops"]),
 ) as dag:
     # TODO: API 상태 체크 결과 가져오기
-    get_api_status_task = EmptyOperator(task_id="get_branch_by_api_status")
-
+    get_api_status_task = BranchPythonOperator(
+        task_id="get_branch_by_api_status",
+        python_callable=get_branch_by_api_status,
+    )
     # TODO: 현재 컨테이너에서 실행 중인 모델의 creation_time 가져오기
-    get_deployed_model_creation_time_task = EmptyOperator(
+    get_deployed_model_creation_time_task = PythonOperator(
         task_id="get_deployed_model_creation_time",
+        python_callable=get_deployed_model_creation_time,
     )
 
     # TODO: 로컬에서 최신 학습된 모델의 creation_time 가져오기
-    get_latest_trained_model_creation_time_task = EmptyOperator(
+    get_latest_trained_model_creation_time_task = PythonOperator(
         task_id="get_latest_trained_model_creation_time",
+        python_callable=get_latest_trained_model_creation_time,
     )
 
     # TODO: 모델을 업데이트할지 결정
-    decide_update_task = EmptyOperator(
+    decide_update_task = BranchPythonOperator(
         task_id="decide_update",
+        python_callable=decide_model_update,
     )
 
     # TODO: 새로운 모델을 배포
-    deploy_new_model_task = EmptyOperator(
+    deploy_new_model_task = BashOperator(
         task_id="deploy_new_model",
+        bash_command=f"cd {airflow_dags_path}/api/docker &&"
+        "docker compose up --build --detach",
+        trigger_rule="one_success",
     )
 
     # 배포를 건너뛸 경우 실행할 더미 태스크
